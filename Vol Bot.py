@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 client = JsonRpcClient("https://s2.ripple.com:51234")  # Mainnet URL
 
 # Telegram bot token (replace with your token in production)
-TELEGRAM_TOKEN = "put telegram bot api key here"
+TELEGRAM_TOKEN = "YOUR_TELEGRAM_TOKEN_HERE"
 
 # Database file
 DB_FILE = "wallets.db"
@@ -325,7 +325,8 @@ def main():
     application.add_handler(CommandHandler("vol", start_vol))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_passphrase))
-    application.add_handler(MessageHandler(filters.Regex(r'^(check|cancel)$', flags=re.IGNORECASE), check_deposit))
+    # Use precompiled regex with re.IGNORECASE
+    application.add_handler(MessageHandler(filters.Regex(re.compile(r'^(check|cancel)$', re.IGNORECASE)), check_deposit))
     application.add_handler(CommandHandler("stop", stop_vol))
 
     logger.info("Bot running...")
