@@ -5,169 +5,67 @@ import os
 from typing import Dict, Any, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
-from xrpl.asyncio.clients import AsyncJsonRpcClient
+from xrpl.asyncio.clients import AsyncWebsocketClient
 from xrpl.asyncio.transaction import submit_and_wait
 from xrpl.asyncio.ledger import get_latest_validated_ledger_sequence
-from xrpl.models.requests import (
-    AccountInfo, AccountLines, AccountTx, BookOffers, Ledger, RipplePathFind,
-    ServerInfo, Tx, Fee, AccountChannels, AccountCurrencies, AccountObjects, AccountOffers,
-    LedgerEntry, GatewayBalances, NoRippleCheck, AMMInfo, NFTBuyOffers, NFTSellOffers
-)
-from xrpl.models.transactions import (
-    Payment, OfferCreate, OfferCancel, TrustSet, AccountSet, CheckCash, CheckCreate,
-    EscrowCreate, EscrowFinish, EscrowCancel, PaymentChannelCreate, PaymentChannelClaim,
-    PaymentChannelFund, SignerListSet, TicketCreate, NFTokenMint, NFTokenBurn,
-    NFTokenCreateOffer, NFTokenAcceptOffer, NFTokenCancelOffer,
-    AMMCreate, AMMWithdraw, AMMDeposit, AMMBid, AMMVote
-)
-from xrpl.models.amounts import IssuedCurrencyAmount
+from xrpl.models.requests import AccountInfo, BookOffers, AMMInfo, Fee
+from xrpl.models.transactions import Payment, OfferCreate, AMMCreate, AMMDeposit, AMMWithdraw, AMMBid, AMMVote, EscrowCreate, EscrowFinish, EscrowCancel, PaymentChannelCreate, PaymentChannelClaim
 from xrpl.wallet import Wallet
 from xrpl.utils import xrp_to_drops, drops_to_xrp
 from xrpl.core.addresscodec import is_valid_classic_address
-from cryptography.fernet import Fernet
-import base64
-import hashlib
-import json
-from datetime import datetime, timedelta, UTC
-import time
 import matplotlib.pyplot as plt
 import io
 from statistics import mean, stdev
-from collections import Counter
-
-# Custom formatter to handle missing user_id
-class CustomFormatter(logging.Formatter):
-    def format(self, record):
-        if not hasattr(record, 'user_id'):
-            record.user_id = 'N/A'
-        return super().format(record)
+import time
+from datetime import datetime
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-handler = logging.StreamHandler()
-formatter = CustomFormatter('%(asctime)s - %(name)s - %(levelname)s - %(user_id)s - %(message)s')
-handler.setFormatter(formatter)
-logger.handlers = [handler]
 
-class XRPLBotAgent:
+class XRPLBot:
     def __init__(self):
-        self.client = None  # Will be initialized in init()
-        self.current_network = None
-        self.application = None
+        self.client = AsyncWebsocketClient("wss://xrplcluster.com/")
+        self.application = Application.builder().token("8102741853:AAHraWG0DUmFnRhzLL043tBcchSMYNNmItk").build()  # Replace with your token
         self.pending_inputs = {}
-        self.price_cache = {}  # {currency_issuer: [(timestamp, price), ...]}
-        self.DB_DIR = "db"
-        self.DB_NAME = os.path.join(self.DB_DIR, "xrpl_bot.db")
-        self.TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # Add your token here
-        self.NETWORKS = {
-            "ripple_s1": "https://s1.ripple.com:51234/",
-            "ripple_s2": "https://s2.ripple.com:51234/"
-        }
-        self.SLIPPAGE_DISCLAIMER = "\nNote: Slippage may affect final amount received."
-        self.init()
-
-    def init(self):
-        self.client = AsyncJsonRpcClient(self.NETWORKS["ripple_s1"])
-        self.current_network = "ripple_s1"
-        self.application = Application.builder().token(self.TELEGRAM_TOKEN).build()
-        self.pending_inputs = {}
-        self.price_cache = {}
-        self._setup_handlers()
+        self.DB_NAME = "xrpl_bot.db"
         self.init_db()
+        self._setup_handlers()
+        self.application.job_queue.run_repeating(self.fetch_all_user_tokens, interval=60, first=10)
 
-    # Database Functions
+    ### Database Setup
     def init_db(self):
-        if not os.path.exists(self.DB_DIR):
-            os.makedirs(self.DB_DIR)
-            logger.info(f"Created database directory: {self.DB_DIR}")
+        """Initialize SQLite database for wallets, price history, tokens, and settings."""
         conn = sqlite3.connect(self.DB_NAME, check_same_thread=False)
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS users 
-                     (user_id INTEGER, wallet_name TEXT, encrypted_seed TEXT, secret_name TEXT, is_current INTEGER DEFAULT 0, slippage REAL DEFAULT 5.0,
+                     (user_id INTEGER, wallet_name TEXT, seed TEXT, is_current INTEGER DEFAULT 0, 
                       PRIMARY KEY (user_id, wallet_name))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS secrets 
-                     (user_id INTEGER, secret_name TEXT, secret_value TEXT, is_default INTEGER DEFAULT 0,
-                      PRIMARY KEY (user_id, secret_name))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS price_history 
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, currency TEXT, issuer TEXT, timestamp INTEGER, 
+                      bid_price REAL, ask_price REAL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS user_tokens 
+                     (user_id INTEGER, currency TEXT, issuer TEXT, PRIMARY KEY (user_id, currency, issuer))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS user_settings 
+                     (user_id INTEGER PRIMARY KEY, default_currency TEXT, default_issuer TEXT, slippage_tolerance REAL)''')
         conn.commit()
         conn.close()
 
-    def get_fernet_key(self, user_id: int, secret_value: str) -> bytes:
-        key_material = f"{user_id}{secret_value}".encode()
-        key = hashlib.sha256(key_material).digest()[:32]
-        return base64.urlsafe_b64encode(key)
-
-    def encrypt_seed(self, seed: str, user_id: int, secret_name: str) -> bytes:
-        secret_value = self.get_secret(user_id, secret_name)
-        fernet = Fernet(self.get_fernet_key(user_id, secret_value))
-        return fernet.encrypt(seed.encode())
-
-    def decrypt_seed(self, encrypted_seed: bytes, user_id: int, secret_name: str) -> str:
-        secret_value = self.get_secret(user_id, secret_name)
-        fernet = Fernet(self.get_fernet_key(user_id, secret_value))
-        return fernet.decrypt(encrypted_seed).decode()
-
-    def add_secret(self, user_id: int, secret_name: str, secret_value: str) -> bool:
-        conn = sqlite3.connect(self.DB_NAME)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM secrets WHERE user_id = ?", (user_id,))
-        is_first = c.fetchone()[0] == 0
-        c.execute("INSERT OR REPLACE INTO secrets (user_id, secret_name, secret_value, is_default) VALUES (?, ?, ?, ?)",
-                  (user_id, secret_name, secret_value, 1 if is_first else 0))
-        conn.commit()
-        conn.close()
-        return True
-
-    def get_secret(self, user_id: int, secret_name: Optional[str] = None) -> Optional[str]:
-        conn = sqlite3.connect(self.DB_NAME)
-        c = conn.cursor()
-        if secret_name:
-            c.execute("SELECT secret_value FROM secrets WHERE user_id = ? AND secret_name = ?", (user_id, secret_name))
-        else:
-            c.execute("SELECT secret_value FROM secrets WHERE user_id = ? AND is_default = 1", (user_id,))
-        result = c.fetchone()
-        conn.close()
-        return result[0] if result else None
-
-    def set_default_secret(self, user_id: int, secret_name: str) -> bool:
-        conn = sqlite3.connect(self.DB_NAME)
-        c = conn.cursor()
-        c.execute("UPDATE secrets SET is_default = 0 WHERE user_id = ?", (user_id,))
-        c.execute("UPDATE secrets SET is_default = 1 WHERE user_id = ? AND secret_name = ?", (user_id, secret_name))
-        conn.commit()
-        conn.close()
-        return c.rowcount > 0
-
+    ### Wallet Management
     def get_wallet(self, user_id: int, wallet_name: str = None) -> Optional[Wallet]:
+        """Retrieve a user's current or specified wallet."""
         conn = sqlite3.connect(self.DB_NAME)
         c = conn.cursor()
         if wallet_name:
-            c.execute("SELECT encrypted_seed, secret_name FROM users WHERE user_id = ? AND wallet_name = ?",
-                      (user_id, wallet_name))
+            c.execute("SELECT seed FROM users WHERE user_id = ? AND wallet_name = ?", (user_id, wallet_name))
         else:
-            c.execute("SELECT encrypted_seed, secret_name FROM users WHERE user_id = ? AND is_current = 1",
-                      (user_id,))
+            c.execute("SELECT seed FROM users WHERE user_id = ? AND is_current = 1", (user_id,))
         result = c.fetchone()
         conn.close()
-        if result and result[0]:
-            encrypted_seed, secret_name = result
-            seed = self.decrypt_seed(encrypted_seed, user_id, secret_name)
-            return Wallet.from_seed(seed)
-        return None
-
-    def get_all_wallets(self, user_id: int) -> list[tuple[str, Wallet]]:
-        conn = sqlite3.connect(self.DB_NAME)
-        c = conn.cursor()
-        c.execute("SELECT wallet_name, encrypted_seed, secret_name FROM users WHERE user_id = ?", (user_id,))
-        results = c.fetchall()
-        conn.close()
-        wallets = []
-        for wallet_name, encrypted_seed, secret_name in results:
-            seed = self.decrypt_seed(encrypted_seed, user_id, secret_name)
-            wallets.append((wallet_name, Wallet.from_seed(seed)))
-        return wallets
+        return Wallet.from_seed(result[0]) if result else None
 
     def set_current_wallet(self, user_id: int, wallet_name: str) -> bool:
+        """Set a wallet as the current one for a user."""
         conn = sqlite3.connect(self.DB_NAME)
         c = conn.cursor()
         c.execute("UPDATE users SET is_current = 0 WHERE user_id = ?", (user_id,))
@@ -176,886 +74,776 @@ class XRPLBotAgent:
         conn.close()
         return c.rowcount > 0
 
-    def get_slippage(self, user_id: int, wallet_name: str = None) -> float:
-        conn = sqlite3.connect(self.DB_NAME)
-        c = conn.cursor()
-        if wallet_name:
-            c.execute("SELECT slippage FROM users WHERE user_id = ? AND wallet_name = ?", (user_id, wallet_name))
-        else:
-            c.execute("SELECT slippage FROM users WHERE user_id = ? AND is_current = 1", (user_id,))
-        result = c.fetchone()
-        conn.close()
-        return result[0] if result else 5.0
-
-    def set_slippage(self, user_id: int, slippage: float, wallet_name: str = None) -> bool:
-        conn = sqlite3.connect(self.DB_NAME)
-        c = conn.cursor()
-        if wallet_name:
-            c.execute("UPDATE users SET slippage = ? WHERE user_id = ? AND wallet_name = ?",
-                      (slippage, user_id, wallet_name))
-        else:
-            c.execute("UPDATE users SET slippage = ? WHERE user_id = ? AND is_current = 1",
-                      (slippage, user_id))
-        affected = c.rowcount > 0
-        conn.commit()
-        conn.close()
-        return affected
-
-    # XRPL Utilities
-    async def calculate_dynamic_slippage(self, currency: str, issuer: str) -> float:
-        try:
-            request = BookOffers(taker_pays="XRP",
-                                 taker_gets=IssuedCurrencyAmount(currency=currency, issuer=issuer, value="1"))
-            async with asyncio.timeout(10):
-                response = await self.client.request(request)
-            if response.is_successful() and response.result["offers"]:
-                prices = [float(offer["TakerPays"]) / float(offer["TakerGets"]) for offer in response.result["offers"][-10:]]
-                if len(prices) > 1:
-                    volatility = (max(prices) - min(prices)) / min(prices) * 100
-                    return min(max(2.0, volatility * 1.5), 30.0)
-            return 5.0
-        except Exception as e:
-            logger.exception(f"Error calculating dynamic slippage: {e}")
-            return 5.0
-
+    ### XRPL Utilities
     async def get_fee(self) -> str:
-        response = await self.client.request(Fee())
-        return response.result["drops"]["base_fee"] if response.is_successful() else "10"
+        """Get the current network fee."""
+        async with self.client:
+            response = await self.client.request(Fee())
+            return response.result["drops"]["base_fee"] if response.is_successful() else "10"
 
     async def get_ledger_index(self) -> int:
-        return await get_latest_validated_ledger_sequence(self.client)
+        """Get the latest validated ledger index."""
+        async with self.client:
+            return await get_latest_validated_ledger_sequence(self.client)
 
-    # Data Fetching and Caching
-    async def fetch_price_data(self, quote_currency: str, issuer: str, periods: int = 20) -> list[tuple[float, float]]:
-        key = f"XRP_{quote_currency}_{issuer}"
-        if key not in self.price_cache:
-            self.price_cache[key] = []
+    async def get_balance(self, wallet: Wallet) -> float:
+        """Get XRP balance for a wallet."""
+        async with self.client:
+            response = await self.client.request(AccountInfo(account=wallet.classic_address, ledger_index="validated"))
+            return drops_to_xrp(response.result["account_data"]["Balance"]) if response.is_successful() else 0.0
 
-        prices = []
-        for network in ["ripple_s1", "ripple_s2"]:
-            try:
-                if network != self.current_network:
-                    self.client = AsyncJsonRpcClient(self.NETWORKS[network])
-                    self.current_network = network
-                for _ in range(periods - len(prices)):
-                    async with asyncio.timeout(10):
-                        response = await self.client.request(BookOffers(
-                            taker_pays="XRP",
-                            taker_gets=IssuedCurrencyAmount(currency=quote_currency, issuer=issuer, value="1")
-                        ))
-                    if response.is_successful() and response.result["offers"]:
-                        price = float(response.result["offers"][0]["TakerPays"]) / float(
-                            response.result["offers"][0]["TakerGets"])
-                        prices.append((time.time(), price))
-                    else:
-                        logger.warning(
-                            f"No offers found for XRP/{quote_currency} with issuer {issuer} on {network}")
-                        break
-                    await asyncio.sleep(2)
-                break
-            except Exception as e:
-                logger.error(f"Failed to fetch price data from {network}: {e}")
-                if network == "ripple_s2":
-                    logger.error("Both XRPL nodes failed; using cached/default data")
+    ### Trading and Price Fetching
+    async def fetch_price_data(self, currency: str, issuer: str) -> Dict[str, float]:
+        """Fetch real-time bid and ask prices from the DEX order book."""
+        async with self.client:
+            bid_request = BookOffers(taker_gets={"currency": "XRP"}, taker_pays={"currency": currency, "issuer": issuer}, limit=1)
+            bid_response = await self.client.request(bid_request)
+            bid_offers = bid_response.result.get("offers", [])
+            best_bid = float(bid_offers[0]["quality"]) if bid_offers else 0.0
 
-        if not prices:
-            prices = self.price_cache[key][-periods:] if self.price_cache[key] else [(time.time(), 0.5)] * periods
-        else:
-            self.price_cache[key].extend(prices)
-            prices = self.price_cache[key][-periods:]
+            ask_request = BookOffers(taker_gets={"currency": currency, "issuer": issuer}, taker_pays={"currency": "XRP"}, limit=1)
+            ask_response = await self.client.request(ask_request)
+            ask_offers = ask_response.result.get("offers", [])
+            best_ask = 1 / float(ask_offers[0]["quality"]) if ask_offers else 0.0
 
-        return prices
+            if best_bid and best_ask:
+                conn = sqlite3.connect(self.DB_NAME)
+                c = conn.cursor()
+                c.execute("INSERT INTO price_history (currency, issuer, timestamp, bid_price, ask_price) VALUES (?, ?, ?, ?, ?)",
+                          (currency, issuer, int(time.time()), best_bid, best_ask))
+                conn.commit()
+                conn.close()
+            return {"bid": best_bid, "ask": best_ask}
 
-    # Technical Analysis Functions
-    def calculate_fibonacci_levels(self, high: float, low: float) -> Dict[str, float]:
-        diff = high - low
-        return {
-            "0%": low,
-            "23.6%": low + (diff * 0.236),
-            "38.2%": low + (diff * 0.382),
-            "50%": low + (diff * 0.5),
-            "61.8%": low + (diff * 0.618),
-            "100%": high,
-            "161.8%": high + (diff * 0.618)
-        }
+    async def fetch_all_user_tokens(self, context: ContextTypes.DEFAULT_TYPE):
+        """Fetch price data for all user tokens periodically."""
+        conn = sqlite3.connect(self.DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT currency, issuer FROM user_tokens")
+        tokens = c.fetchall()
+        conn.close()
+        for currency, issuer in tokens:
+            await self.fetch_price_data(currency, issuer)
 
+    ### Technical Analysis
     def calculate_sma(self, prices: list[float], period: int) -> list[float]:
-        sma = []
-        for i in range(len(prices)):
-            if i < period - 1:
-                sma.append(None)
-            else:
-                sma.append(mean(prices[i - period + 1:i + 1]))
-        return sma
+        """Calculate Simple Moving Average."""
+        return [mean(prices[max(0, i-period+1):i+1]) for i in range(len(prices))]
 
     def calculate_ema(self, prices: list[float], period: int) -> list[float]:
-        ema = [prices[0]] if prices else []
+        """Calculate Exponential Moving Average."""
+        if not prices:
+            return []
+        ema = [prices[0]]
         multiplier = 2 / (period + 1)
-        for i in range(1, len(prices)):
-            ema.append((prices[i] * multiplier) + (ema[-1] * (1 - multiplier)))
-        return [None] * (period - 1) + ema[-len(prices) + period - 1:] if len(prices) >= period else [None] * len(prices)
+        for price in prices[1:]:
+            ema.append(price * multiplier + ema[-1] * (1 - multiplier))
+        return ema
 
-    def calculate_rsi(self, prices: list[float], period: int = 14) -> list[float]:
-        rsi = [None] * (period - 1)
-        if len(prices) < period + 1:
-            return rsi + [50.0] * (len(prices) - period + 1)
-        gains, losses = [], []
-        for i in range(1, len(prices)):
-            diff = prices[i] - prices[i - 1]
-            gains.append(max(diff, 0))
-            losses.append(max(-diff, 0))
-        for i in range(period - 1, len(gains)):
-            avg_gain = mean(gains[i - period + 1:i + 1]) if gains[i - period + 1:i + 1] else 0
-            avg_loss = mean(losses[i - period + 1:i + 1]) if losses[i - period + 1:i + 1] else 0
-            rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
-            rsi.append(100 - (100 / (1 + rs)))
-        return rsi
-
-    def calculate_bollinger_bands(self, prices: list[float], period: int = 20) -> tuple[list[float], list[float], list[float]]:
+    def calculate_bollinger_bands(self, prices: list[float], period: int) -> tuple[list[float], list[float], list[float]]:
+        """Calculate Bollinger Bands."""
         sma = self.calculate_sma(prices, period)
         upper, lower = [], []
         for i in range(len(prices)):
-            if i < period - 1:
-                upper.append(None)
-                lower.append(None)
-            else:
-                window = prices[i - period + 1:i + 1]
-                std = stdev(window) if len(window) > 1 else 0
-                upper.append(sma[i] + 2 * std if sma[i] is not None else None)
-                lower.append(sma[i] - 2 * std if sma[i] is not None else None)
+            window = prices[max(0, i-period+1):i+1]
+            std = stdev(window) if len(window) > 1 else 0
+            upper.append(sma[i] + 2 * std)
+            lower.append(sma[i] - 2 * std)
         return upper, sma, lower
 
-    def calculate_macd(self, prices: list[float], short_period: int = 12, long_period: int = 26,
-                       signal_period: int = 9) -> tuple[list[float], list[float], list[float]]:
-        ema_short = self.calculate_ema(prices, short_period)
-        ema_long = self.calculate_ema(prices, long_period)
-        macd_line = [None if s is None or l is None else s - l for s, l in zip(ema_short, ema_long)]
-        signal_line = self.calculate_ema([m for m in macd_line if m is not None], signal_period)
-        signal_line = [None] * (len(macd_line) - len(signal_line)) + signal_line
-        histogram = [None if m is None or s is None else m - s for m, s in zip(macd_line, signal_line)]
-        return macd_line, signal_line, histogram
+    def calculate_fibonacci_levels(self, prices: list[float]) -> Dict[str, float]:
+        """Calculate Fibonacci retracement levels."""
+        high, low = max(prices), min(prices)
+        diff = high - low
+        return {
+            "0%": low,
+            "23.6%": low + diff * 0.236,
+            "38.2%": low + diff * 0.382,
+            "50%": low + diff * 0.5,
+            "61.8%": low + diff * 0.618,
+            "100%": high
+        }
 
-    def calculate_support_resistance(self, prices: list[float], bins: int = 10) -> tuple[float, float]:
-        hist, edges = [], []
-        valid_prices = [p for p in prices if p is not None]
-        if not valid_prices:
-            return 0.5, 0.5
-        for i in range(0, len(valid_prices), bins):
-            chunk = valid_prices[i:i + bins]
-            if chunk:
-                counts = Counter([round(p, 2) for p in chunk])
-                hist.extend(counts.values())
-                edges.extend(counts.keys())
-        if not edges:
-            return min(valid_prices), max(valid_prices)
-        support = edges[hist.index(max(hist))] if hist else min(valid_prices)
-        resistance = edges[hist.index(max(hist))] if hist else max(valid_prices)
-        return support, resistance
+    async def generate_chart(self, currency: str, issuer: str) -> tuple[io.BytesIO, float]:
+        """Generate a technical analysis chart with current price highlighted."""
+        conn = sqlite3.connect(self.DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT timestamp, (bid_price + ask_price) / 2 FROM price_history WHERE currency = ? AND issuer = ? ORDER BY timestamp LIMIT 50",
+                  (currency, issuer))
+        data = c.fetchall()
+        conn.close()
 
-    async def calculate_volume(self, wallet: str, periods: int = 20) -> list[float]:
-        response = await self.client.request(AccountTx(account=wallet, limit=periods))
-        if not response.is_successful() or "transactions" not in response.result:
-            return [0.0] * periods
-        volumes = []
-        for tx in response.result["transactions"]:
-            if "Amount" in tx["tx"]:
-                amount = tx["tx"]["Amount"]
-                volumes.append(float(amount) / 1_000_000 if isinstance(amount, str) else float(amount["value"]))
-        return volumes + [0.0] * (periods - len(volumes)) if len(volumes) < periods else volumes[-periods:]
+        if len(data) < 10:
+            raise ValueError("Insufficient data for chart")
 
-    def calculate_stochastic(self, prices: list[float], period: int = 14) -> list[float]:
-        stochastic = []
-        for i in range(len(prices)):
-            if i < period - 1:
-                stochastic.append(None)
-            else:
-                window = [p for p in prices[i - period + 1:i + 1] if p is not None]
-                if not window:
-                    stochastic.append(None)
-                else:
-                    highest = max(window)
-                    lowest = min(window)
-                    stochastic.append(100 * (prices[i] - lowest) / (highest - lowest) if highest != lowest else 50)
-        return stochastic
+        times, prices = zip(*data)
+        prices = list(prices)
+        current_price = prices[-1]
+        sma = self.calculate_sma(prices, 10)
+        upper_bb, _, lower_bb = self.calculate_bollinger_bands(prices, 20)
+        fib_levels = self.calculate_fibonacci_levels(prices)
 
-    def calculate_atr(self, prices: list[float], period: int = 14) -> list[float]:
-        atr = []
-        if len(prices) < 2:
-            return [0.0] * len(prices)
-        trs = []
-        for i in range(1, len(prices)):
-            if prices[i] is not None and prices[i - 1] is not None:
-                tr = max(prices[i] - prices[i - 1], 0)
-                trs.append(tr)
-        for i in range(len(prices)):
-            if i < period:
-                atr.append(None)
-            else:
-                window = trs[i - period:i]
-                atr.append(mean(window) if window else None)
-        return atr
-
-    async def generate_chart(self, user_id: int, quote_currency: str, issuer: str,
-                             prices: list[tuple[float, float]],
-                             fib_levels: Optional[Dict[str, float]] = None) -> io.BytesIO:
-        times, price_values = zip(*prices)
-        price_values = [float(p) for p in price_values]
-        plt.figure(figsize=(12, 10))
-
-        # Price Plot with Indicators
-        plt.subplot(3, 1, 1)
-        plt.plot(range(len(price_values)), price_values, label="Price", color="blue")
-        if fib_levels:
-            for level, value in fib_levels.items():
-                plt.axhline(y=value, linestyle="--", label=f"Fib {level}", alpha=0.7)
-        sma_10 = self.calculate_sma(price_values, 10)
-        upper_bb, sma_20, lower_bb = self.calculate_bollinger_bands(price_values, 20)
-        support, resistance = self.calculate_support_resistance(price_values)
-        plt.plot(range(len(sma_10)), sma_10, label="SMA (10)", color="orange")
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(len(prices)), prices, label="Price", color="blue")
+        plt.plot(range(len(sma)), sma, label="SMA (10)", color="orange")
         plt.plot(range(len(upper_bb)), upper_bb, label="BB Upper", color="green", linestyle="--")
         plt.plot(range(len(lower_bb)), lower_bb, label="BB Lower", color="red", linestyle="--")
-        plt.axhline(y=support, linestyle="-", color="purple", label="Support", alpha=0.5)
-        plt.axhline(y=resistance, linestyle="-", color="pink", label="Resistance", alpha=0.5)
-        plt.title(f"XRP/{quote_currency} Price Chart (Issuer: {issuer[:6]})")
-        plt.xlabel("Time (Recent Trades)")
-        plt.ylabel(f"Price ({quote_currency})")
+        plt.axhline(y=current_price, color='purple', linestyle='-', label='Current Price')
+        for level, value in fib_levels.items():
+            plt.axhline(y=value, linestyle=":", label=f"Fib {level}", color="gray")
         plt.legend()
-        plt.grid(True)
-
-        # RSI and Stochastic
-        plt.subplot(3, 1, 2)
-        rsi = self.calculate_rsi(price_values, 14)
-        stochastic = self.calculate_stochastic(price_values, 14)
-        plt.plot(range(len(rsi)), rsi, label="RSI (14)", color="purple")
-        plt.plot(range(len(stochastic)), stochastic, label="Stochastic (14)", color="cyan")
-        plt.axhline(y=70, linestyle="--", color="red", alpha=0.5)
-        plt.axhline(y=30, linestyle="--", color="green", alpha=0.5)
-        plt.title("RSI & Stochastic")
-        plt.xlabel("Time (Recent Trades)")
-        plt.ylabel("Value")
-        plt.legend()
-        plt.grid(True)
-
-        # MACD and Volume
-        plt.subplot(3, 1, 3)
-        macd_line, signal_line, histogram = self.calculate_macd(price_values)
-        wallet = self.get_wallet(user_id).classic_address if self.get_wallet(user_id) else "rDefault"
-        volume = await self.calculate_volume(wallet, len(price_values))
-        plt.plot(range(len(macd_line)), macd_line, label="MACD", color="blue")
-        plt.plot(range(len(signal_line)), signal_line, label="Signal", color="orange")
-        plt.bar(range(len(histogram)), histogram, label="Histogram", color="grey", alpha=0.5)
-        plt.twinx()
-        plt.plot(range(len(volume)), volume, label="Volume", color="green", alpha=0.3)
-        plt.title("MACD & Volume")
-        plt.xlabel("Time (Recent Trades)")
-        plt.ylabel("MACD")
-        plt.legend()
-        plt.grid(True)
+        plt.title(f"{currency} Price Analysis")
+        plt.xlabel("Time")
+        plt.ylabel("Price (XRP)")
 
         buf = io.BytesIO()
-        plt.tight_layout()
         plt.savefig(buf, format="png")
         buf.seek(0)
         plt.close()
-        return buf
+        return buf, current_price
 
-    # UI Functions
+    ### Telegram UI - Menu System with Emojis
     def get_main_menu(self):
+        """Main menu keyboard with emojis."""
         keyboard = [
             [InlineKeyboardButton("👛 Wallet", callback_data="wallet_menu"),
-             InlineKeyboardButton("💸 Trading", callback_data="trading_menu")],
-            [InlineKeyboardButton("🔗 Payments", callback_data="payments_menu"),
-             InlineKeyboardButton("📊 Info", callback_data="info_menu")],
-            [InlineKeyboardButton("🔒 Advanced", callback_data="advanced_menu"),
-             InlineKeyboardButton("⚙️ Settings", callback_data="settings_menu")],
-            [InlineKeyboardButton("🏦 AMM", callback_data="amm_menu"),
-             InlineKeyboardButton("🖼 NFTs", callback_data="nft_menu")],
-            [InlineKeyboardButton("📈 Analysis", callback_data="analysis_menu")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_analysis_menu(self):
-        keyboard = [
-            [InlineKeyboardButton("📏 Fibonacci Chart", callback_data="fibonacci_chart"),
-             InlineKeyboardButton("📉 TA Chart", callback_data="ta_chart")],
-            [InlineKeyboardButton("Back", callback_data="main_menu")]
+             InlineKeyboardButton("💸 Trade", callback_data="trade_menu")],
+            [InlineKeyboardButton("💰 Pay", callback_data="pay_menu"),
+             InlineKeyboardButton("🏦 AMM", callback_data="amm_menu")],
+            [InlineKeyboardButton("🔒 Escrow", callback_data="escrow_menu"),
+             InlineKeyboardButton("💳 Payment Channels", callback_data="payment_channel_menu")],
+            [InlineKeyboardButton("📊 Analysis", callback_data="analysis_menu"),
+             InlineKeyboardButton("⚙️ Settings", callback_data="settings_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)
 
     def get_wallet_menu(self):
+        """Wallet menu keyboard with emojis."""
         keyboard = [
             [InlineKeyboardButton("✨ Create Wallet", callback_data="create_wallet"),
-             InlineKeyboardButton("🎩 Switch Wallet", callback_data="switch_wallet")],
-            [InlineKeyboardButton("🦄 Balance", callback_data="balance"),
-             InlineKeyboardButton("📊 Portfolio", callback_data="portfolio")],
-            [InlineKeyboardButton("Back", callback_data="main_menu")]
+             InlineKeyboardButton("🔄 Switch Wallet", callback_data="switch_wallet")],
+            [InlineKeyboardButton("📥 Import Wallet", callback_data="import_wallet"),
+             InlineKeyboardButton("💰 Check Balance", callback_data="check_balance")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)
 
-    def get_trading_menu(self):
+    def get_trade_menu(self):
+        """Trade menu keyboard with emojis."""
         keyboard = [
-            [InlineKeyboardButton("💸 Buy", callback_data="buy"),
-             InlineKeyboardButton("💰 Sell", callback_data="sell")],
-            [InlineKeyboardButton("📈 Buy At Price", callback_data="buy_at"),
-             InlineKeyboardButton("📉 Sell At Price", callback_data="sell_at")],
-            [InlineKeyboardButton("❌ Cancel Order", callback_data="cancel_order"),
-             InlineKeyboardButton("💲 Price Check", callback_data="price")],
-            [InlineKeyboardButton("Back", callback_data="main_menu")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_payments_menu(self):
-        keyboard = [
-            [InlineKeyboardButton("🎀 Send XRP", callback_data="send"),
-             InlineKeyboardButton("🍭 Distribute XRP", callback_data="distribute")],
-            [InlineKeyboardButton("🌈 Trustline", callback_data="trustline"),
-             InlineKeyboardButton("🔗 Payment Path", callback_data="payment_path")],
-            [InlineKeyboardButton("💸 Pay Channel Create", callback_data="pay_channel_create"),
-             InlineKeyboardButton("✅ Pay Channel Claim", callback_data="pay_channel_claim")],
-            [InlineKeyboardButton("Back", callback_data="main_menu")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_info_menu(self):
-        keyboard = [
-            [InlineKeyboardButton("📜 History", callback_data="history"),
-             InlineKeyboardButton("📋 Ledger Info", callback_data="ledger_info")],
-            [InlineKeyboardButton("🏦 Gateway Balances", callback_data="gateway_balances"),
-             InlineKeyboardButton("🔍 Server Info", callback_data="server_info")],
-            [InlineKeyboardButton("Back", callback_data="main_menu")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_advanced_menu(self):
-        keyboard = [
-            [InlineKeyboardButton("🔒 Escrow Create", callback_data="escrow_create"),
-             InlineKeyboardButton("✅ Escrow Finish", callback_data="escrow_finish")],
-            [InlineKeyboardButton("❌ Escrow Cancel", callback_data="escrow_cancel"),
-             InlineKeyboardButton("📝 Check Create", callback_data="check_create")],
-            [InlineKeyboardButton("💵 Check Cash", callback_data="check_cash"),
-             InlineKeyboardButton("🎟 Ticket Create", callback_data="ticket_create")],
-            [InlineKeyboardButton("Back", callback_data="main_menu")]
-        ]
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_settings_menu(self):
-        keyboard = [
-            [InlineKeyboardButton("🔮 Add Secret", callback_data="add_secret"),
-             InlineKeyboardButton("🌟 Set Default Secret", callback_data="set_default_secret")],
-            [InlineKeyboardButton("⚙️ Set Slippage", callback_data="set_slippage"),
-             InlineKeyboardButton("🌐 Switch Network", callback_data="network")],
-            [InlineKeyboardButton("💾 Backup", callback_data="backup"),
-             InlineKeyboardButton("🔐 Account Set", callback_data="account_set")],
-            [InlineKeyboardButton("Back", callback_data="main_menu")]
+            [InlineKeyboardButton("📈 Buy", callback_data="buy"),
+             InlineKeyboardButton("📉 Sell", callback_data="sell")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)
 
     def get_amm_menu(self):
+        """AMM menu keyboard with emojis."""
         keyboard = [
-            [InlineKeyboardButton("🏦 Create AMM Pool", callback_data="amm_create"),
-             InlineKeyboardButton("💧 Deposit to AMM", callback_data="amm_deposit")],
-            [InlineKeyboardButton("🏦 Withdraw from AMM", callback_data="amm_withdraw"),
-             InlineKeyboardButton("📈 AMM Bid", callback_data="amm_bid")],
-            [InlineKeyboardButton("🗳 AMM Vote", callback_data="amm_vote"),
-             InlineKeyboardButton("ℹ️ AMM Info", callback_data="amm_info")],
-            [InlineKeyboardButton("Back", callback_data="main_menu")]
+            [InlineKeyboardButton("🏦 Create Pool", callback_data="amm_create"),
+             InlineKeyboardButton("📥 Deposit", callback_data="amm_deposit")],
+            [InlineKeyboardButton("📤 Withdraw", callback_data="amm_withdraw"),
+             InlineKeyboardButton("💵 Bid", callback_data="amm_bid")],
+            [InlineKeyboardButton("🗳️ Vote", callback_data="amm_vote"),
+             InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)
 
-    def get_nft_menu(self):
+    def get_escrow_menu(self):
+        """Escrow menu keyboard with emojis."""
         keyboard = [
-            [InlineKeyboardButton("🖼 Mint NFT", callback_data="nft_mint"),
-             InlineKeyboardButton("🔥 Burn NFT", callback_data="nft_burn")],
-            [InlineKeyboardButton("🤝 Create NFT Offer", callback_data="nft_offer_create"),
-             InlineKeyboardButton("✅ Accept NFT Offer", callback_data="nft_offer_accept")],
-            [InlineKeyboardButton("❌ Cancel NFT Offer", callback_data="nft_offer_cancel"),
-             InlineKeyboardButton("📜 NFT Buy Offers", callback_data="nft_buy_offers")],
-            [InlineKeyboardButton("Back", callback_data="main_menu")]
+            [InlineKeyboardButton("🔒 Create Escrow", callback_data="escrow_create"),
+             InlineKeyboardButton("✅ Finish Escrow", callback_data="escrow_finish")],
+            [InlineKeyboardButton("❌ Cancel Escrow", callback_data="escrow_cancel"),
+             InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)
 
-    def get_wallet_selection(self, user_id: int, action: str, back_action: str = "wallet_menu"):
-        wallets = self.get_all_wallets(user_id)
-        if not wallets:
-            return InlineKeyboardMarkup([[InlineKeyboardButton("No wallets! Back", callback_data=back_action)]])
-        keyboard = [[InlineKeyboardButton(f"{name}", callback_data=f"{action}|{name}")] for name, _ in wallets]
-        keyboard.append([InlineKeyboardButton("Back", callback_data=back_action)])
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_amount_selection(self, action: str, currency: str = "", issuer: str = ""):
-        amounts = ["1", "10", "50", "100", "500"]
-        keyboard = [[InlineKeyboardButton(f"{amt}", callback_data=f"{action}|{amt}|{currency}|{issuer}")] for amt in amounts]
-        keyboard.append([InlineKeyboardButton("Back",
-                                              callback_data="trading_menu" if "buy" in action or "sell" in action else "payments_menu")])
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_currency_selection(self, action: str, amount: str):
-        currencies = ["USD", "EUR", "BTC"]
-        keyboard = [[InlineKeyboardButton(curr, callback_data=f"{action}|{amount}|{curr}")] for curr in currencies]
-        keyboard.append([InlineKeyboardButton("Back",
-                                              callback_data="trading_menu" if "buy" in action or "sell" in action else "payments_menu")])
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_issuer_selection(self, action: str, amount: str, currency: str):
-        issuers = ["rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B", "r456..."]
-        keyboard = [[InlineKeyboardButton(issuer[:6], callback_data=f"{action}|{amount}|{currency}|{issuer}")] for issuer in issuers]
-        keyboard.append([InlineKeyboardButton("Back",
-                                              callback_data="trading_menu" if "buy" in action or "sell" in action else "payments_menu")])
-        return InlineKeyboardMarkup(keyboard)
-
-    def get_slippage_selection(self, action: str, amount: str, currency: str, issuer: str):
+    def get_payment_channel_menu(self):
+        """Payment Channel menu keyboard with emojis."""
         keyboard = [
-            [InlineKeyboardButton("Static (5%)", callback_data=f"{action}|{amount}|{currency}|{issuer}|static")],
-            [InlineKeyboardButton("Dynamic (2-30%)", callback_data=f"{action}|{amount}|{currency}|{issuer}|dynamic")],
-            [InlineKeyboardButton("Back", callback_data="trading_menu")]
+            [InlineKeyboardButton("💳 Create Payment Channel", callback_data="payment_channel_create"),
+             InlineKeyboardButton("💸 Claim from Payment Channel", callback_data="payment_channel_claim")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)
 
-    def get_confirmation(self, action: str, details: str, back_action: str = "main_menu"):
+    def get_analysis_menu(self):
+        """Analysis menu keyboard with emojis."""
         keyboard = [
-            [InlineKeyboardButton("Yes", callback_data=f"{action}_confirm|{details}"),
-             InlineKeyboardButton("No", callback_data=back_action)]
+            [InlineKeyboardButton("📊 Analyze Token", callback_data="analyze_token"),
+             InlineKeyboardButton("🔍 Add Token Pairing", callback_data="add_token_pairing")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)
 
-    def get_fibonacci_trade_menu(self, levels: Dict[str, float]):
+    def get_settings_menu(self):
+        """Settings menu keyboard with emojis."""
         keyboard = [
-            [InlineKeyboardButton(f"Buy at {k} ({v:.2f})", callback_data=f"buy_at_fib|{k}|{v}") for k, v in list(levels.items())[:3]],
-            [InlineKeyboardButton(f"Sell at {k} ({v:.2f})", callback_data=f"sell_at_fib|{k}|{v}") for k, v in list(levels.items())[4:6]],
-            [InlineKeyboardButton("Back", callback_data="analysis_menu")]
+            [InlineKeyboardButton("🔗 Set Default Token Pairing", callback_data="set_default_pairing"),
+             InlineKeyboardButton("📉 Set Slippage Tolerance", callback_data="set_slippage")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]
         ]
         return InlineKeyboardMarkup(keyboard)
 
-    # Telegram Handlers
+    ### Handlers
     def _setup_handlers(self):
+        """Set up Telegram handlers."""
         self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CallbackQueryHandler(self.button))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_input))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))
 
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command."""
         user_id = update.message.from_user.id
-        logger.info("User started bot", extra={'user_id': user_id})
-        await update.message.reply_text("Welcome to your XRP Bot! 🌌", reply_markup=self.get_main_menu())
+        logger.info(f"User {user_id} started the bot")
+        await update.message.reply_text("Welcome to XRPL Bot! 🌟", reply_markup=self.get_main_menu())
 
-    async def button(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def button(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle button clicks for all menu options."""
         query = update.callback_query
         await query.answer()
         user_id = query.from_user.id
         data = query.data.split("|")
         action = data[0]
 
-        response = await self.handle_message({
-            "user_id": user_id,
-            "action": action,
-            "data": data[1:] if len(data) > 1 else [],
-            "telegram_query": query
-        })
+        # Main Menu Navigation
+        if action == "main_menu":
+            await query.edit_message_text("🌟 Main Menu", reply_markup=self.get_main_menu())
+        elif action == "wallet_menu":
+            await query.edit_message_text("👛 Wallet Options", reply_markup=self.get_wallet_menu())
+        elif action == "trade_menu":
+            await query.edit_message_text("💸 Trade Options", reply_markup=self.get_trade_menu())
+        elif action == "pay_menu":
+            self.pending_inputs[user_id] = ("pay_address", [])
+            await query.edit_message_text("💰 Enter destination address:")
+        elif action == "amm_menu":
+            await query.edit_message_text("🏦 AMM Options", reply_markup=self.get_amm_menu())
+        elif action == "escrow_menu":
+            await query.edit_message_text("🔒 Escrow Options", reply_markup=self.get_escrow_menu())
+        elif action == "payment_channel_menu":
+            await query.edit_message_text("💳 Payment Channel Options", reply_markup=self.get_payment_channel_menu())
+        elif action == "analysis_menu":
+            await query.edit_message_text("📊 Analysis Options", reply_markup=self.get_analysis_menu())
+        elif action == "settings_menu":
+            await query.edit_message_text("⚙️ Settings", reply_markup=self.get_settings_menu())
 
-        if "telegram_response" in response:
-            await query.edit_message_text(response["telegram_response"],
-                                          reply_markup=response.get("reply_markup", self.get_main_menu()))
-        elif "image" in response:
-            await query.message.reply_photo(response["image"], caption=response.get("caption", ""),
-                                            reply_markup=response.get("reply_markup", self.get_main_menu()))
-            await query.delete()
-        elif "error" in response:
-            await query.edit_message_text(f"Error: {response['error']}", reply_markup=self.get_main_menu())
+        # Wallet Functions
+        elif action == "create_wallet":
+            wallet = Wallet.create()
+            wallet_name = f"wallet_{int(time.time())}"
+            conn = sqlite3.connect(self.DB_NAME)
+            c = conn.cursor()
+            c.execute("INSERT INTO users (user_id, wallet_name, seed, is_current) VALUES (?, ?, ?, ?)",
+                      (user_id, wallet_name, wallet.seed, 1))
+            conn.commit()
+            conn.close()
+            await query.edit_message_text(f"✨ Wallet created: {wallet.classic_address}", reply_markup=self.get_wallet_menu())
 
-    async def handle_text_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        elif action == "switch_wallet":
+            conn = sqlite3.connect(self.DB_NAME)
+            c = conn.cursor()
+            c.execute("SELECT wallet_name FROM users WHERE user_id = ?", (user_id,))
+            wallets = c.fetchall()
+            conn.close()
+            if not wallets:
+                await query.edit_message_text("🔴 No wallets found.", reply_markup=self.get_wallet_menu())
+            else:
+                keyboard = [[InlineKeyboardButton(w[0], callback_data=f"switch_select|{w[0]}")] for w in wallets]
+                keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="wallet_menu")])
+                await query.edit_message_text("🔄 Select a wallet:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+        elif action == "switch_select":
+            wallet_name = data[1]
+            if self.set_current_wallet(user_id, wallet_name):
+                await query.edit_message_text(f"🔄 Switched to {wallet_name}", reply_markup=self.get_wallet_menu())
+            else:
+                await query.edit_message_text("🔴 Switch failed.", reply_markup=self.get_wallet_menu())
+
+        elif action == "check_balance":
+            wallet = self.get_wallet(user_id)
+            if wallet:
+                balance = await self.get_balance(wallet)
+                await query.edit_message_text(f"💰 Balance: {balance} XRP", reply_markup=self.get_wallet_menu())
+            else:
+                await query.edit_message_text("🔴 No wallet selected.", reply_markup=self.get_wallet_menu())
+
+        elif action == "import_wallet":
+            self.pending_inputs[user_id] = ("import_wallet_seed", [])
+            await query.edit_message_text("📥 Enter your wallet seed to import:")
+
+        # Trade Functions
+        elif action == "buy":
+            self.pending_inputs[user_id] = ("buy_currency", ["buy"])
+            await query.edit_message_text("📈 Enter token currency code to buy (e.g., USD):")
+        elif action == "sell":
+            self.pending_inputs[user_id] = ("sell_currency", ["sell"])
+            await query.edit_message_text("📉 Enter token currency code to sell (e.g., USD):")
+
+        # AMM Functions
+        elif action == "amm_create":
+            self.pending_inputs[user_id] = ("amm_create_currency", [])
+            await query.edit_message_text("🏦 Enter token currency code for AMM pool:")
+        elif action == "amm_deposit":
+            self.pending_inputs[user_id] = ("amm_deposit_currency", [])
+            await query.edit_message_text("📥 Enter token currency code for AMM deposit:")
+        elif action == "amm_withdraw":
+            self.pending_inputs[user_id] = ("amm_withdraw_currency", [])
+            await query.edit_message_text("📤 Enter token currency code for AMM withdrawal:")
+        elif action == "amm_bid":
+            self.pending_inputs[user_id] = ("amm_bid_currency", [])
+            await query.edit_message_text("💵 Enter token currency code for AMM bid:")
+        elif action == "amm_vote":
+            self.pending_inputs[user_id] = ("amm_vote_currency", [])
+            await query.edit_message_text("🗳️ Enter token currency code for AMM vote:")
+
+        # Escrow Functions
+        elif action == "escrow_create":
+            self.pending_inputs[user_id] = ("escrow_amount", [])
+            await query.edit_message_text("🔒 Enter amount for escrow:")
+        elif action == "escrow_finish":
+            self.pending_inputs[user_id] = ("escrow_finish_sequence", [])
+            await query.edit_message_text("✅ Enter escrow sequence to finish:")
+        elif action == "escrow_cancel":
+            self.pending_inputs[user_id] = ("escrow_cancel_sequence", [])
+            await query.edit_message_text("❌ Enter escrow sequence to cancel:")
+
+        # Payment Channel Functions
+        elif action == "payment_channel_create":
+            self.pending_inputs[user_id] = ("payment_channel_amount", [])
+            await query.edit_message_text("💳 Enter amount for payment channel:")
+        elif action == "payment_channel_claim":
+            self.pending_inputs[user_id] = ("payment_channel_claim_channel", [])
+            await query.edit_message_text("💸 Enter channel ID to claim:")
+
+        # Analysis Functions
+        elif action == "analyze_token":
+            self.pending_inputs[user_id] = ("analyze_token_currency", [])
+            await query.edit_message_text("📊 Enter token currency code for analysis (e.g., USD):")
+        elif action == "add_token_pairing":
+            self.pending_inputs[user_id] = ("add_token_pairing_currency", [])
+            await query.edit_message_text("🔍 Enter token currency code to add (e.g., USD):")
+
+        # Settings Functions
+        elif action == "set_default_pairing":
+            self.pending_inputs[user_id] = ("set_default_currency", [])
+            await query.edit_message_text("🔗 Enter default token currency code (e.g., USD):")
+        elif action == "set_slippage":
+            self.pending_inputs[user_id] = ("set_slippage_value", [])
+            await query.edit_message_text("📉 Enter slippage tolerance percentage (e.g., 5):")
+
+    async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle text input for all operations."""
         user_id = update.message.from_user.id
         text = update.message.text
-        if user_id in self.pending_inputs:
-            action, params = self.pending_inputs[user_id]
-            del self.pending_inputs[user_id]
-            response = await self.handle_message({
-                "user_id": user_id,
-                "action": action,
-                "data": params + [text],
-                "telegram_query": None
-            })
-            if "telegram_response" in response:
-                await update.message.reply_text(response["telegram_response"],
-                                                reply_markup=response.get("reply_markup", self.get_main_menu()))
-            elif "image" in response:
-                await update.message.reply_photo(response["image"], caption=response.get("caption", ""),
-                                                 reply_markup=response.get("reply_markup", self.get_main_menu()))
-            elif "error" in response:
-                await update.message.reply_text(f"Error: {response['error']}", reply_markup=self.get_main_menu())
+        if user_id not in self.pending_inputs:
+            return
 
-    # Core Agent Logic
-    async def handle_message(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        user_id = args.get("user_id")
-        action = args.get("action", "").lower()
-        data = args.get("data", [])
-        telegram_query = args.get("telegram_query")
+        action, params = self.pending_inputs[user_id]
+        del self.pending_inputs[user_id]
 
-        if not user_id:
-            return {"error": "user_id is required"}
-
-        try:
-            # Main Menu Navigation
-            if action == "main_menu":
-                return {"telegram_response": "Pick an option! 🌌", "reply_markup": self.get_main_menu()}
-            elif action == "wallet_menu":
-                return {"telegram_response": "Wallet Options:", "reply_markup": self.get_wallet_menu()}
-            elif action == "trading_menu":
-                return {"telegram_response": "Trading Options:", "reply_markup": self.get_trading_menu()}
-            elif action == "payments_menu":
-                return {"telegram_response": "Payment Options:", "reply_markup": self.get_payments_menu()}
-            elif action == "info_menu":
-                return {"telegram_response": "Info Options:", "reply_markup": self.get_info_menu()}
-            elif action == "advanced_menu":
-                return {"telegram_response": "Advanced Options:", "reply_markup": self.get_advanced_menu()}
-            elif action == "settings_menu":
-                return {"telegram_response": "Settings Options:", "reply_markup": self.get_settings_menu()}
-            elif action == "amm_menu":
-                return {"telegram_response": "AMM Options:", "reply_markup": self.get_amm_menu()}
-            elif action == "nft_menu":
-                return {"telegram_response": "NFT Options:", "reply_markup": self.get_nft_menu()}
-            elif action == "analysis_menu":
-                return {"telegram_response": "Analysis Tools:", "reply_markup": self.get_analysis_menu()}
-
-            # Wallet Management
-            elif action == "create_wallet":
-                new_wallet = Wallet.create()
-                secret_name = self.get_secret(user_id) or "default"
-                encrypted_seed = self.encrypt_seed(new_wallet.seed, user_id, secret_name)
+        # Wallet Importing
+        if action == "import_wallet_seed":
+            seed = text
+            try:
+                wallet = Wallet.from_seed(seed)
+                wallet_name = f"imported_{int(time.time())}"
                 conn = sqlite3.connect(self.DB_NAME)
                 c = conn.cursor()
-                wallet_name = f"wallet_{time.time()}"
-                c.execute(
-                    "INSERT INTO users (user_id, wallet_name, encrypted_seed, secret_name, is_current, slippage) VALUES (?, ?, ?, ?, ?, ?)",
-                    (user_id, wallet_name, encrypted_seed, secret_name, 1, 5.0))
+                c.execute("INSERT INTO users (user_id, wallet_name, seed, is_current) VALUES (?, ?, ?, ?)",
+                          (user_id, wallet_name, seed, 0))
                 conn.commit()
                 conn.close()
-                logger.info(f"Wallet created for user", extra={'user_id': user_id})
-                return {"telegram_response": f"✨ Wallet created: {new_wallet.classic_address}",
-                        "result": {"address": new_wallet.classic_address, "wallet_name": wallet_name}}
+                await update.message.reply_text(f"📥 Wallet imported: {wallet.classic_address}", reply_markup=self.get_wallet_menu())
+            except Exception as e:
+                await update.message.reply_text(f"🔴 Invalid seed: {e}", reply_markup=self.get_wallet_menu())
 
-            elif action == "switch_wallet":
-                return {"telegram_response": "🎩 Select a wallet:",
-                        "reply_markup": self.get_wallet_selection(user_id, "switch_wallet_select")}
+        # Trading Handlers
+        elif action == "buy_currency" or action == "sell_currency":
+            trade_type = params[0]
+            self.pending_inputs[user_id] = (f"{trade_type}_issuer", [trade_type, text.upper()])
+            await update.message.reply_text(f"Enter issuer address for {text.upper()}:")
 
-            elif action == "switch_wallet_select":
-                wallet_name = data[0]
-                if self.set_current_wallet(user_id, wallet_name):
-                    logger.info(f"Switched wallet for user", extra={'user_id': user_id})
-                    return {"telegram_response": f"🎩 Switched to wallet '{wallet_name}'!"}
-                return {"error": "Failed to switch wallet"}
+        elif action == "buy_issuer" or action == "sell_issuer":
+            trade_type, currency = params[0], params[1]
+            issuer = text
+            if not is_valid_classic_address(issuer):
+                await update.message.reply_text("🔴 Invalid issuer address.", reply_markup=self.get_trade_menu())
+                return
+            self.pending_inputs[user_id] = (f"{trade_type}_amount", [trade_type, currency, issuer])
+            await update.message.reply_text(f"Enter amount to {trade_type}:")
 
-            elif action == "balance":
-                wallet = self.get_wallet(user_id)
-                if not wallet:
-                    return {"telegram_response": "🦄 No wallet set!", "error": "No wallet set"}
-                response = await self.client.request(
-                    AccountInfo(account=wallet.classic_address, ledger_index="validated"))
-                if response.is_successful():
-                    balance = drops_to_xrp(response.result["account_data"]["Balance"])
-                    logger.info(f"Checked balance for user", extra={'user_id': user_id})
-                    return {"telegram_response": f"🦄 XRP Balance: {balance}", "result": {"balance": balance}}
-                return {"error": "Failed to fetch balance"}
-
-            elif action == "portfolio":
-                wallet = self.get_wallet(user_id)
-                if not wallet:
-                    return {"telegram_response": "📊 No wallet set!", "error": "No wallet set"}
-                lines = await self.client.request(AccountLines(account=wallet.classic_address))
-                xrp = await self.client.request(
-                    AccountInfo(account=wallet.classic_address, ledger_index="validated"))
-                balances = [f"🟢 XRP: {drops_to_xrp(xrp.result['account_data']['Balance'])}"]
-                portfolio = [{"currency": "XRP", "balance": drops_to_xrp(xrp.result["account_data"]["Balance"])}]
-                if lines.is_successful():
-                    for line in lines.result["lines"]:
-                        balances.append(f"🟢 {line['currency']} ({line['account'][:6]}): {line['balance']}")
-                        portfolio.append({"currency": line["currency"], "issuer": line["account"],
-                                          "balance": float(line["balance"])})
-                logger.info(f"Retrieved portfolio for user", extra={'user_id': user_id})
-                return {"telegram_response": f"📊 Portfolio:\n" + "\n".join(balances),
-                        "result": {"portfolio": portfolio}}
-
-            # Trading
-            elif action == "buy":
-                return {"telegram_response": "💸 Select amount to buy:",
-                        "reply_markup": self.get_amount_selection("buy_amount")}
-
-            elif action == "buy_amount":
-                amount = data[0]
-                return {"telegram_response": f"💸 Buying {amount} - Select currency:",
-                        "reply_markup": self.get_currency_selection("buy_currency", amount)}
-
-            elif action == "buy_currency":
-                amount, currency = data[0], data[1]
-                return {"telegram_response": f"💸 Buying {amount} {currency} - Select issuer:",
-                        "reply_markup": self.get_issuer_selection("buy_issuer", amount, currency)}
-
-            elif action == "buy_issuer":
-                amount, currency, issuer = data[0], data[1], data[2]
-                return {"telegram_response": f"💸 Buying {amount} {currency} ({issuer[:6]}) - Slippage:",
-                        "reply_markup": self.get_slippage_selection("buy_slippage", amount, currency, issuer)}
-
-            elif action == "buy_slippage":
-                amount, currency, issuer, slippage_type = data[0], data[1], data[2], data[3]
-                slippage = await self.calculate_dynamic_slippage(currency,
-                                                                 issuer) if slippage_type == "dynamic" else self.get_slippage(user_id)
-                details = f"{amount}|{currency}|{issuer}|{slippage}"
-                return {
-                    "telegram_response": f"💸 Confirm buy: {amount} {currency} ({issuer[:6]}) with {slippage}% slippage? {self.SLIPPAGE_DISCLAIMER}",
-                    "reply_markup": self.get_confirmation("buy", details, "trading_menu")}
-
-            elif action == "buy_confirm":
-                amount, currency, issuer, slippage = data[0].split("|")
-                wallet = self.get_wallet(user_id)
-                if not wallet:
-                    return {"error": "No wallet set"}
-                slippage = float(slippage)
-                token_amount = IssuedCurrencyAmount(currency=currency, issuer=issuer, value=amount)
-                offer_tx = OfferCreate(account=wallet.classic_address, taker_pays=token_amount,
-                                       taker_gets=xrp_to_drops(float(amount) * (1 + slippage / 100)))
-                response = await submit_and_wait(offer_tx, self.client, wallet)
-                if response.is_successful():
-                    logger.info(f"Buy order placed for user", extra={'user_id': user_id})
-                    return {
-                        "telegram_response": f"💸 Bought {amount} {currency}! Sequence: {response.result['tx_json']['Sequence']}",
-                        "result": {"sequence": response.result["tx_json"]["Sequence"]}}
-                return {"error": "Buy failed"}
-
-            elif action == "sell":
-                return {"telegram_response": "💰 Select amount to sell:",
-                        "reply_markup": self.get_amount_selection("sell_amount")}
-
-            # Payments
-            elif action == "send" or action == "distribute":
-                return {"telegram_response": f"{'🎀' if action == 'send' else '🍭'} Send XRP - Select amount:",
-                        "reply_markup": self.get_amount_selection(f"{action}_amount")}
-
-            elif action in ["send_amount", "distribute_amount"]:
-                amount = data[0]
-                self.pending_inputs[user_id] = (f"{action.split('_')[0]}_dest", [amount])
-                return {
-                    "telegram_response": f"{'🎀' if action.startswith('send') else '🍭'} Sending {amount} XRP - Enter destination address (e.g., r123...):"}
-
-            elif action in ["send_dest", "distribute_dest"]:
-                amount, destination = data[0], data[1]
-                wallet = self.get_wallet(user_id)
-                if not wallet:
-                    return {"error": "No wallet set"}
-                if not is_valid_classic_address(destination):
-                    return {"error": "Invalid destination address"}
-                payment_tx = Payment(account=wallet.classic_address, destination=destination,
-                                     amount=xrp_to_drops(float(amount)))
-                response = await submit_and_wait(payment_tx, self.client, wallet)
-                if response.is_successful():
-                    logger.info(f"XRP sent/distributed for user", extra={'user_id': user_id})
-                    return {
-                        "telegram_response": f"{'🎀' if action.startswith('send') else '🍭'} Sent {amount} XRP to {destination[:6]}! Sequence: {response.result['tx_json']['Sequence']}",
-                        "result": {"sequence": response.result["tx_json"]["Sequence"]}}
-                return {"error": "Send failed"}
-
-            elif action == "trustline":
-                return {"telegram_response": "🌈 Set trustline - Select currency:",
-                        "reply_markup": self.get_currency_selection("trustline_currency", "")}
-
-            elif action == "trustline_currency":
-                currency = data[1]
-                return {"telegram_response": f"🌈 Setting trustline for {currency} - Select issuer:",
-                        "reply_markup": self.get_issuer_selection("trustline_issuer", "", currency)}
-
-            elif action == "trustline_issuer":
-                currency, issuer = data[1], data[2]
-                wallet = self.get_wallet(user_id)
-                if not wallet:
-                    return {"error": "No wallet set"}
-                trust_tx = TrustSet(account=wallet.classic_address,
-                                    limit_amount=IssuedCurrencyAmount(currency=currency, issuer=issuer,
-                                                                      value="1000000"))
-                response = await submit_and_wait(trust_tx, self.client, wallet)
-                if response.is_successful():
-                    logger.info(f"Trustline set for user", extra={'user_id': user_id})
-                    return {
-                        "telegram_response": f"🌈 Trustline set for {currency} from {issuer[:6]}! Sequence: {response.result['tx_json']['Sequence']}",
-                        "result": {"sequence": response.result["tx_json"]["Sequence"]}}
-                return {"error": "Trustline creation failed"}
-
-            elif action == "payment_path":
-                return {"telegram_response": "🔗 Payment Path - Select amount:",
-                        "reply_markup": self.get_amount_selection("payment_path_amount")}
-
-            elif action == "payment_path_amount":
-                amount = data[0]
-                self.pending_inputs[user_id] = ("payment_path_dest", [amount])
-                return {
-                    "telegram_response": f"🔗 Finding path for {amount} XRP - Enter destination address (e.g., r123...):"}
-
-            elif action == "payment_path_dest":
-                amount, destination = data[0], data[1]
-                wallet = self.get_wallet(user_id)
-                if not wallet:
-                    return {"error": "No wallet set"}
-                if not is_valid_classic_address(destination):
-                    return {"error": "Invalid destination address"}
-                path_request = RipplePathFind(
-                    source_account=wallet.classic_address,
-                    destination_account=destination,
-                    destination_amount=xrp_to_drops(float(amount))
-                )
-                response = await self.client.request(path_request)
-                if response.is_successful() and response.result.get("alternatives"):
-                    paths = response.result["alternatives"]
-                    msg = f"🔗 Found {len(paths)} payment paths to {destination[:6]}:\n"
-                    for i, path in enumerate(paths[:3], 1):
-                        msg += f"Path {i}: {json.dumps(path['paths_computed'][0][:2] if path['paths_computed'] else 'Direct', indent=2)}\n"
-                    logger.info(f"Payment paths found for user", extra={'user_id': user_id})
-                    return {"telegram_response": msg, "result": {"paths": paths}}
-                return {"error": "No payment paths found"}
-
-            # Info
-            elif action == "ledger_info":
-                response = await self.client.request(Ledger(ledger_index="validated"))
-                if response.is_successful():
-                    ledger = response.result["ledger"]
-                    info = f"📋 Ledger Index: {ledger['ledger_index']}\nClosed: {ledger['close_time_human']}\nTotal XRP: {drops_to_xrp(ledger['total_coins'])}"
-                    logger.info(f"Ledger info retrieved for user", extra={'user_id': user_id})
-                    return {"telegram_response": info, "result": ledger}
-                return {"error": "Failed to fetch ledger info"}
-
-            elif action == "history":
-                wallet = self.get_wallet(user_id)
-                if not wallet:
-                    return {"error": "No wallet set"}
-                response = await self.client.request(AccountTx(account=wallet.classic_address, limit=5))
-                if response.is_successful():
-                    txs = [
-                        f"📜 {tx['tx']['TransactionType']} - {tx['tx'].get('Amount', 'N/A')} - {tx['tx'].get('Destination', 'N/A')[:6]}"
-                        for tx in response.result["transactions"]]
-                    logger.info(f"Transaction history retrieved for user", extra={'user_id': user_id})
-                    return {"telegram_response": "📜 Recent Transactions:\n" + "\n".join(txs),
-                            "result": response.result["transactions"]}
-                return {"error": "Failed to fetch transaction history"}
-
-            # Advanced
-            elif action == "escrow_create":
-                return {"telegram_response": "🔒 Escrow Create - Select amount:",
-                        "reply_markup": self.get_amount_selection("escrow_create_amount")}
-
-            elif action == "escrow_create_amount":
-                amount = data[0]
-                self.pending_inputs[user_id] = ("escrow_create_dest", [amount])
-                return {
-                    "telegram_response": f"🔒 Creating escrow for {amount} XRP - Enter destination address (e.g., r123...):"}
-
-            elif action == "escrow_create_dest":
-                amount, destination = data[0], data[1]
-                wallet = self.get_wallet(user_id)
-                if not wallet:
-                    return {"error": "No wallet set"}
-                escrow_tx = EscrowCreate(
-                    account=wallet.classic_address,
-                    amount=xrp_to_drops(float(amount)),
-                    destination=destination,
-                    finish_after=int(time.time()) + 86400
-                )
-                response = await submit_and_wait(escrow_tx, self.client, wallet)
-                if response.is_successful():
-                    logger.info(f"Escrow created for user", extra={'user_id': user_id})
-                    return {
-                        "telegram_response": f"🔒 Escrow created for {amount} XRP! Sequence: {response.result['tx_json']['Sequence']}",
-                        "result": {"sequence": response.result["tx_json"]["Sequence"]}}
-                return {"error": "Escrow creation failed"}
-
-            # Settings
-            elif action == "set_slippage":
-                return {"telegram_response": "⚙️ Set slippage - Select value (in %):",
-                        "reply_markup": self.get_amount_selection("set_slippage_value")}
-
-            elif action == "set_slippage_value":
-                slippage = float(data[0])
-                if self.set_slippage(user_id, slippage):
-                    logger.info(f"Slippage set for user", extra={'user_id': user_id})
-                    return {"telegram_response": f"⚙️ Slippage set to {slippage}%",
-                            "result": {"slippage": slippage}}
-                return {"error": "Failed to set slippage"}
-
-            # Analysis
-            elif action == "ta_chart":
-                self.pending_inputs[user_id] = ("ta_chart_currency", [])
-                return {"telegram_response": "📉 Enter the quote currency for the XRP TA chart (e.g., USD):"}
-
-            elif action == "ta_chart_currency":
-                quote_currency = data[0].upper()
-                self.pending_inputs[user_id] = ("ta_chart_issuer", [quote_currency])
-                return {
-                    "telegram_response": f"📉 Enter the issuer address for XRP/{quote_currency} (e.g., rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B for Bitstamp USD):"}
-
-            elif action == "ta_chart_issuer":
-                quote_currency, issuer = data[0], data[1]
-                if not is_valid_classic_address(issuer):
-                    return {"error": "Invalid issuer address"}
-                prices = await self.fetch_price_data(quote_currency, issuer, 20)
-                if len(prices) < 10 or all(p[1] == 0.5 for p in prices):
-                    return {
-                        "error": f"No sufficient offer data found for XRP/{quote_currency} with issuer {issuer}"}
-                chart = await self.generate_chart(user_id, quote_currency, issuer, prices)
-                logger.info(f"TA chart generated for user with XRP/{quote_currency} (issuer: {issuer})",
-                            extra={'user_id': user_id})
-                return {"image": chart, "caption": f"XRP/{quote_currency} TA Chart (Issuer: {issuer[:6]})"}
-
-            elif action == "fibonacci_chart":
-                self.pending_inputs[user_id] = ("fibonacci_high", [])
-                return {"telegram_response": "📏 Enter the high price (e.g., 1.5):"}
-
-            elif action == "fibonacci_high":
-                high = float(data[0])
-                self.pending_inputs[user_id] = ("fibonacci_low", [high])
-                return {"telegram_response": f"📏 High set to {high}. Enter the low price (e.g., 1.0):"}
-
-            elif action == "fibonacci_low":
-                high, low = float(data[0]), float(data[1])
-                levels = self.calculate_fibonacci_levels(high, low)
-                prices = await self.fetch_price_data("USD", "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B", 20)
-                if len(prices) < 10:
-                    return {"error": "Insufficient price data for chart"}
-                chart = await self.generate_chart(user_id, "USD", "rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B", prices, levels)
-                msg = "📈 Fibonacci Levels:\n" + "\n".join([f"{k}: {v:.2f}" for k, v in levels.items()])
-                logger.info(f"Fibonacci chart generated for user", extra={'user_id': user_id})
-                return {"image": chart, "caption": msg, "reply_markup": self.get_fibonacci_trade_menu(levels)}
-
-            elif action in ["buy_at_fib", "sell_at_fib"]:
-                level_key, price = data[0], float(data[1])
-                wallet = self.get_wallet(user_id)
-                if not wallet:
-                    return {"error": "No wallet set"}
-                amount = xrp_to_drops(1)
-                tx = OfferCreate(
-                    account=wallet.classic_address,
-                    taker_gets=amount if action == "buy_at_fib" else IssuedCurrencyAmount(currency="USD",
-                                                                                          issuer="rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
-                                                                                          value="1"),
-                    taker_pays=IssuedCurrencyAmount(currency="USD", issuer="rvYAfWj5gh67oV6fW32ZzP3Aw4Eubs59B",
-                                                    value=str(price)) if action == "buy_at_fib" else amount
-                )
+        elif action == "buy_amount" or action == "sell_amount":
+            trade_type, currency, issuer = params[0], params[1], params[2]
+            amount = float(text)
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_trade_menu())
+                return
+            prices = await self.fetch_price_data(currency, issuer)
+            if not prices["bid"] or not prices["ask"]:
+                await update.message.reply_text("🔴 No market data available.", reply_markup=self.get_trade_menu())
+                return
+            if trade_type == "buy":
+                xrp_amount = amount * prices["ask"]
+                tx = OfferCreate(account=wallet.classic_address, taker_gets={"currency": currency, "issuer": issuer, "value": str(amount)},
+                                 taker_pays=xrp_to_drops(xrp_amount))
+            else:
+                xrp_amount = amount * prices["bid"]
+                tx = OfferCreate(account=wallet.classic_address, taker_gets=xrp_to_drops(xrp_amount),
+                                 taker_pays={"currency": currency, "issuer": issuer, "value": str(amount)})
+            async with self.client:
                 response = await submit_and_wait(tx, self.client, wallet)
                 if response.is_successful():
-                    logger.info(f"Trade executed at Fibonacci level for user", extra={'user_id': user_id})
-                    return {
-                        "telegram_response": f"{'💸 Bought' if action == 'buy_at_fib' else '💰 Sold'} at {level_key} ({price:.2f})! Sequence: {response.result['tx_json']['Sequence']}"}
-                return {"error": "Trade failed"}
+                    await update.message.reply_text(f"✅ {trade_type.capitalize()} successful: {amount} {currency}", reply_markup=self.get_trade_menu())
+                else:
+                    await update.message.reply_text(f"🔴 {trade_type.capitalize()} failed.", reply_markup=self.get_trade_menu())
 
-            else:
-                return {"error": f"Unknown action: {action}"}
+        # Payment Handler
+        elif action == "pay_address":
+            destination = text
+            if not is_valid_classic_address(destination):
+                await update.message.reply_text("🔴 Invalid address.", reply_markup=self.get_main_menu())
+                return
+            self.pending_inputs[user_id] = ("pay_amount", [destination])
+            await update.message.reply_text("💰 Enter amount in XRP:")
 
-        except ValueError as e:
-            return {"error": f"Invalid input: {e}"}
-        except Exception as e:
-            logger.error(f"Error handling action {action}: {str(e)}", extra={'user_id': user_id})
-            return {"error": str(e)}
+        elif action == "pay_amount":
+            destination = params[0]
+            amount = float(text)
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_main_menu())
+                return
+            tx = Payment(account=wallet.classic_address, destination=destination, amount=xrp_to_drops(amount))
+            async with self.client:
+                response = await submit_and_wait(tx, self.client, wallet)
+                if response.is_successful():
+                    await update.message.reply_text(f"✅ Payment of {amount} XRP sent to {destination}", reply_markup=self.get_main_menu())
+                else:
+                    await update.message.reply_text("🔴 Payment failed.", reply_markup=self.get_main_menu())
 
+        # AMM Handlers
+        elif action == "amm_create_currency":
+            currency = text.upper()
+            self.pending_inputs[user_id] = ("amm_create_issuer", [currency])
+            await update.message.reply_text(f"🏦 Enter issuer address for {currency}:")
+
+        elif action == "amm_create_issuer":
+            currency, issuer = params[0], text
+            if not is_valid_classic_address(issuer):
+                await update.message.reply_text("🔴 Invalid issuer address.", reply_markup=self.get_amm_menu())
+                return
+            self.pending_inputs[user_id] = ("amm_create_amounts", [currency, issuer])
+            await update.message.reply_text("🏦 Enter XRP amount and token amount (e.g., '10 100'):")
+
+        elif action == "amm_create_amounts":
+            currency, issuer = params[0], params[1]
+            xrp_amount, token_amount = map(float, text.split())
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_amm_menu())
+                return
+            tx = AMMCreate(account=wallet.classic_address, amount=xrp_to_drops(xrp_amount),
+                           amount2={"currency": currency, "issuer": issuer, "value": str(token_amount)},
+                           trading_fee=500)  # 0.5% fee
+            async with self.client:
+                response = await submit_and_wait(tx, self.client, wallet)
+                if response.is_successful():
+                    await update.message.reply_text(f"✅ AMM pool created: {xrp_amount} XRP, {token_amount} {currency}", reply_markup=self.get_amm_menu())
+                else:
+                    await update.message.reply_text("🔴 AMM creation failed.", reply_markup=self.get_amm_menu())
+
+        elif action == "amm_deposit_currency":
+            currency = text.upper()
+            self.pending_inputs[user_id] = ("amm_deposit_issuer", [currency])
+            await update.message.reply_text(f"📥 Enter issuer address for {currency}:")
+
+        elif action == "amm_deposit_issuer":
+            currency, issuer = params[0], text
+            if not is_valid_classic_address(issuer):
+                await update.message.reply_text("🔴 Invalid issuer address.", reply_markup=self.get_amm_menu())
+                return
+            self.pending_inputs[user_id] = ("amm_deposit_amounts", [currency, issuer])
+            await update.message.reply_text("📥 Enter XRP amount and token amount to deposit (e.g., '5 50'):")
+
+        elif action == "amm_deposit_amounts":
+            currency, issuer = params[0], params[1]
+            xrp_amount, token_amount = map(float, text.split())
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_amm_menu())
+                return
+            tx = AMMDeposit(account=wallet.classic_address, amount=xrp_to_drops(xrp_amount),
+                            amount2={"currency": currency, "issuer": issuer, "value": str(token_amount)})
+            async with self.client:
+                response = await submit_and_wait(tx, self.client, wallet)
+                if response.is_successful():
+                    await update.message.reply_text(f"✅ Deposited {xrp_amount} XRP and {token_amount} {currency} to AMM", reply_markup=self.get_amm_menu())
+                else:
+                    await update.message.reply_text("🔴 AMM deposit failed.", reply_markup=self.get_amm_menu())
+
+        elif action == "amm_withdraw_currency":
+            currency = text.upper()
+            self.pending_inputs[user_id] = ("amm_withdraw_issuer", [currency])
+            await update.message.reply_text(f"📤 Enter issuer address for {currency}:")
+
+        elif action == "amm_withdraw_issuer":
+            currency, issuer = params[0], text
+            if not is_valid_classic_address(issuer):
+                await update.message.reply_text("🔴 Invalid issuer address.", reply_markup=self.get_amm_menu())
+                return
+            self.pending_inputs[user_id] = ("amm_withdraw_amount", [currency, issuer])
+            await update.message.reply_text("📤 Enter LP token amount to withdraw:")
+
+        elif action == "amm_withdraw_amount":
+            currency, issuer = params[0], params[1]
+            lp_amount = float(text)
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_amm_menu())
+                return
+            tx = AMMWithdraw(account=wallet.classic_address, amount={"currency": "XRP"}, amount2={"currency": currency, "issuer": issuer},
+                             lp_token_in={"currency": "XXX", "issuer": wallet.classic_address, "value": str(lp_amount)})
+            async with self.client:
+                response = await submit_and_wait(tx, self.client, wallet)
+                if response.is_successful():
+                    await update.message.reply_text(f"✅ Withdrew {lp_amount} LP tokens from AMM", reply_markup=self.get_amm_menu())
+                else:
+                    await update.message.reply_text("🔴 AMM withdrawal failed.", reply_markup=self.get_amm_menu())
+
+        elif action == "amm_bid_currency":
+            currency = text.upper()
+            self.pending_inputs[user_id] = ("amm_bid_issuer", [currency])
+            await update.message.reply_text(f"💵 Enter issuer address for {currency}:")
+
+        elif action == "amm_bid_issuer":
+            currency, issuer = params[0], text
+            if not is_valid_classic_address(issuer):
+                await update.message.reply_text("🔴 Invalid issuer address.", reply_markup=self.get_amm_menu())
+                return
+            self.pending_inputs[user_id] = ("amm_bid_amount", [currency, issuer])
+            await update.message.reply_text("💵 Enter bid amount in XRP:")
+
+        elif action == "amm_bid_amount":
+            currency, issuer = params[0], params[1]
+            amount = float(text)
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_amm_menu())
+                return
+            tx = AMMBid(account=wallet.classic_address, amount=xrp_to_drops(amount),
+                        asset={"currency": "XRP"}, asset2={"currency": currency, "issuer": issuer})
+            async with self.client:
+                response = await submit_and_wait(tx, self.client, wallet)
+                if response.is_successful():
+                    await update.message.reply_text(f"✅ Bid {amount} XRP on AMM", reply_markup=self.get_amm_menu())
+                else:
+                    await update.message.reply_text("🔴 AMM bid failed.", reply_markup=self.get_amm_menu())
+
+        elif action == "amm_vote_currency":
+            currency = text.upper()
+            self.pending_inputs[user_id] = ("amm_vote_issuer", [currency])
+            await update.message.reply_text(f"🗳️ Enter issuer address for {currency}:")
+
+        elif action == "amm_vote_issuer":
+            currency, issuer = params[0], text
+            if not is_valid_classic_address(issuer):
+                await update.message.reply_text("🔴 Invalid issuer address.", reply_markup=self.get_amm_menu())
+                return
+            self.pending_inputs[user_id] = ("amm_vote_fee", [currency, issuer])
+            await update.message.reply_text("🗳️ Enter trading fee to vote for (in basis points, e.g., 500 for 0.5%):")
+
+        elif action == "amm_vote_fee":
+            currency, issuer = params[0], params[1]
+            fee = int(text)
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_amm_menu())
+                return
+            tx = AMMVote(account=wallet.classic_address, asset={"currency": "XRP"},
+                         asset2={"currency": currency, "issuer": issuer}, trading_fee=fee)
+            async with self.client:
+                response = await submit_and_wait(tx, self.client, wallet)
+                if response.is_successful():
+                    await update.message.reply_text(f"✅ Voted for {fee/10000}% fee on AMM", reply_markup=self.get_amm_menu())
+                else:
+                    await update.message.reply_text("🔴 AMM vote failed.", reply_markup=self.get_amm_menu())
+
+        # Escrow Handlers
+        elif action == "escrow_amount":
+            amount = float(text)
+            self.pending_inputs[user_id] = ("escrow_create_destination", [amount])
+            await update.message.reply_text("🔒 Enter destination address for escrow:")
+
+        elif action == "escrow_create_destination":
+            amount, destination = params[0], text
+            if not is_valid_classic_address(destination):
+                await update.message.reply_text("🔴 Invalid destination address.", reply_markup=self.get_escrow_menu())
+                return
+            self.pending_inputs[user_id] = ("escrow_create_condition", [amount, destination])
+            await update.message.reply_text("🔒 Enter condition for escrow (e.g., time in seconds):")
+
+        elif action == "escrow_create_condition":
+            amount, destination, condition = params[0], params[1], text
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_escrow_menu())
+                return
+            tx = EscrowCreate(account=wallet.classic_address, amount=xrp_to_drops(amount),
+                              destination=destination, condition=condition)
+            async with self.client:
+                response = await submit_and_wait(tx, self.client, wallet)
+                if response.is_successful():
+                    await update.message.reply_text(f"✅ Escrow created for {amount} XRP to {destination}", reply_markup=self.get_escrow_menu())
+                else:
+                    await update.message.reply_text("🔴 Escrow creation failed.", reply_markup=self.get_escrow_menu())
+
+        elif action == "escrow_finish_sequence":
+            sequence = int(text)
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_escrow_menu())
+                return
+            tx = EscrowFinish(account=wallet.classic_address, offer_sequence=sequence)
+            async with self.client:
+                response = await submit_and_wait(tx, self.client, wallet)
+                if response.is_successful():
+                    await update.message.reply_text(f"✅ Escrow {sequence} finished", reply_markup=self.get_escrow_menu())
+                else:
+                    await update.message.reply_text("🔴 Failed to finish escrow.", reply_markup=self.get_escrow_menu())
+
+        elif action == "escrow_cancel_sequence":
+            sequence = int(text)
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_escrow_menu())
+                return
+            tx = EscrowCancel(account=wallet.classic_address, offer_sequence=sequence)
+            async with self.client:
+                response = await submit_and_wait(tx, self.client, wallet)
+                if response.is_successful():
+                    await update.message.reply_text(f"✅ Escrow {sequence} canceled", reply_markup=self.get_escrow_menu())
+                else:
+                    await update.message.reply_text("🔴 Failed to cancel escrow.", reply_markup=self.get_escrow_menu())
+
+        # Payment Channel Handlers
+        elif action == "payment_channel_amount":
+            amount = float(text)
+            self.pending_inputs[user_id] = ("payment_channel_destination", [amount])
+            await update.message.reply_text("💳 Enter destination address for payment channel:")
+
+        elif action == "payment_channel_destination":
+            amount, destination = params[0], text
+            if not is_valid_classic_address(destination):
+                await update.message.reply_text("🔴 Invalid destination address.", reply_markup=self.get_payment_channel_menu())
+                return
+            self.pending_inputs[user_id] = ("payment_channel_expiration", [amount, destination])
+            await update.message.reply_text("💳 Enter expiration time for payment channel (in seconds):")
+
+        elif action == "payment_channel_expiration":
+            amount, destination, expiration = params[0], params[1], text
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_payment_channel_menu())
+                return
+            tx = PaymentChannelCreate(account=wallet.classic_address, amount=xrp_to_drops(amount),
+                                      destination=destination, settle_delay=int(expiration))
+            async with self.client:
+                response = await submit_and_wait(tx, self.client, wallet)
+                if response.is_successful():
+                    await update.message.reply_text(f"✅ Payment channel created for {amount} XRP to {destination}", reply_markup=self.get_payment_channel_menu())
+                else:
+                    await update.message.reply_text("🔴 Payment channel creation failed.", reply_markup=self.get_payment_channel_menu())
+
+        elif action == "payment_channel_claim_channel":
+            channel_id = text
+            wallet = self.get_wallet(user_id)
+            if not wallet:
+                await update.message.reply_text("🔴 No wallet selected.", reply_markup=self.get_payment_channel_menu())
+                return
+            tx = PaymentChannelClaim(channel=channel_id, account=wallet.classic_address)
+            async with self.client:
+                response = await submit_and_wait(tx, self.client, wallet)
+                if response.is_successful():
+                    await update.message.reply_text(f"✅ Claimed from payment channel {channel_id}", reply_markup=self.get_payment_channel_menu())
+                else:
+                    await update.message.reply_text("🔴 Failed to claim from payment channel.", reply_markup=self.get_payment_channel_menu())
+
+        # Analysis Handlers
+        elif action == "analyze_token_currency":
+            currency = text.upper()
+            self.pending_inputs[user_id] = ("analyze_token_issuer", [currency])
+            await update.message.reply_text(f"📊 Enter issuer address for {currency}:")
+
+        elif action == "analyze_token_issuer":
+            currency, issuer = params[0], text
+            if not is_valid_classic_address(issuer):
+                await update.message.reply_text("🔴 Invalid issuer address.", reply_markup=self.get_analysis_menu())
+                return
+            try:
+                chart, current_price = await self.generate_chart(currency, issuer)
+                caption = f"📊 {currency} Analysis\n💡 Current Price: {current_price:.4f} XRP"
+                await update.message.reply_photo(chart, caption=caption, reply_markup=self.get_analysis_menu())
+            except ValueError as e:
+                await update.message.reply_text(f"🔴 {str(e)}", reply_markup=self.get_analysis_menu())
+
+        elif action == "add_token_pairing_currency":
+            currency = text.upper()
+            self.pending_inputs[user_id] = ("add_token_pairing_issuer", [currency])
+            await update.message.reply_text(f"🔍 Enter issuer address for {currency}:")
+
+        elif action == "add_token_pairing_issuer":
+            currency, issuer = params[0], text
+            if not is_valid_classic_address(issuer):
+                await update.message.reply_text("🔴 Invalid issuer address.", reply_markup=self.get_analysis_menu())
+                return
+            conn = sqlite3.connect(self.DB_NAME)
+            c = conn.cursor()
+            c.execute("INSERT OR IGNORE INTO user_tokens (user_id, currency, issuer) VALUES (?, ?, ?)", (user_id, currency, issuer))
+            conn.commit()
+            conn.close()
+            await update.message.reply_text(f"🔍 Added {currency} from {issuer} for analysis.", reply_markup=self.get_analysis_menu())
+
+        # Settings Handlers
+        elif action == "set_default_currency":
+            currency = text.upper()
+            self.pending_inputs[user_id] = ("set_default_issuer", [currency])
+            await update.message.reply_text(f"🔗 Enter default issuer address for {currency}:")
+
+        elif action == "set_default_issuer":
+            currency, issuer = params[0], text
+            if not is_valid_classic_address(issuer):
+                await update.message.reply_text("🔴 Invalid issuer address.", reply_markup=self.get_settings_menu())
+                return
+            conn = sqlite3.connect(self.DB_NAME)
+            c = conn.cursor()
+            c.execute("INSERT OR REPLACE INTO user_settings (user_id, default_currency, default_issuer) VALUES (?, ?, ?)",
+                      (user_id, currency, issuer))
+            conn.commit()
+            conn.close()
+            await update.message.reply_text(f"🔗 Default token pairing set to {currency} from {issuer}", reply_markup=self.get_settings_menu())
+
+        elif action == "set_slippage_value":
+            try:
+                slippage = float(text)
+                conn = sqlite3.connect(self.DB_NAME)
+                c = conn.cursor()
+                c.execute("UPDATE user_settings SET slippage_tolerance = ? WHERE user_id = ?", (slippage, user_id))
+                if c.rowcount == 0:
+                    c.execute("INSERT INTO user_settings (user_id, slippage_tolerance) VALUES (?, ?)", (user_id, slippage))
+                conn.commit()
+                conn.close()
+                await update.message.reply_text(f"📉 Slippage tolerance set to {slippage}%", reply_markup=self.get_settings_menu())
+            except ValueError:
+                await update.message.reply_text("🔴 Invalid slippage value.", reply_markup=self.get_settings_menu())
+
+    ### Run the Bot
     def run(self):
-        logger.info("Starting XRPL Telegram bot...")
+        """Start the bot."""
+        logger.info("Starting XRPL Bot...")
         self.application.run_polling()
 
-def main():
-    agent = XRPLBotAgent()
-    agent.run()
-
 if __name__ == "__main__":
-    main()
+    bot = XRPLBot()
+    bot.run()
