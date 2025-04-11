@@ -8,6 +8,7 @@ from statistics import mean, stdev
 from datetime import datetime
 import matplotlib.pyplot as plt
 import io
+from dotenv import load_dotenv  # Add this import
 
 from argon2 import PasswordHasher, exceptions
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -27,6 +28,9 @@ from xrpl.utils import xrp_to_drops, drops_to_xrp
 from xrpl.core.addresscodec import is_valid_classic_address
 from aiohttp import ClientSession, TCPConnector
 
+# Load environment variables from .env file
+load_dotenv()
+
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,8 +47,8 @@ class XRPLBot:
         self.ssl_context.check_hostname = True
         self.client: Optional[AsyncWebsocketClient] = None  # Defer initialization
         self.application = Application.builder().token(os.getenv("raddwall")).build()
-        if not os.getenv("TELEGRAM_BOT_TOKEN"):
-            raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set")
+        if not os.getenv("raddwall"):
+            raise ValueError("raddwall environment variable not set")
         self.pending_inputs: Dict[int, Tuple[str, List[Any]]] = {}
         self.DB_NAME = "xrpl_bot.db"
         self.DB_KEY = os.getenv("SQLCIPHER_KEY")
@@ -55,7 +59,8 @@ class XRPLBot:
         self._setup_handlers()
         self.application.job_queue.run_repeating(self.fetch_all_user_tokens, interval=60, first=10)
 
-    ### WebSocket Client
+
+    ################## WebSocket Client
     def get_client(self) -> AsyncWebsocketClient:
         """Create a WebSocket client with TLS verification."""
         connector = TCPConnector(ssl=self.ssl_context)
@@ -73,7 +78,7 @@ class XRPLBot:
                 logger.warning(f"Failed to connect to {node}: {e}")
         raise ValueError("No available XRPL nodes")
 
-    ### Database Setup
+    # ########## Database Setup
     def get_db_connection(self) -> sqlcipher.Connection:
         """Create an encrypted SQLCipher connection."""
         conn = sqlcipher.connect(self.DB_NAME, check_same_thread=False)
@@ -100,7 +105,7 @@ class XRPLBot:
         conn.commit()
         conn.close()
 
-    ### Seed Encryption with Argon2
+    ########## Seed Encryption with Argon2
     def encrypt_seed(self, seed: str, passphrase: str) -> Tuple[str, str]:
         """Encrypt a wallet seed using Argon2-derived key and AES-256-GCM."""
         salt = os.urandom(16)
@@ -134,7 +139,7 @@ class XRPLBot:
         except Exception as e:
             raise ValueError(f"Decryption failed: {e}")
 
-    ### Wallet Management
+    ############ Wallet Management
     def get_wallet(self, user_id: int, wallet_name: str | None = None, passphrase: str | None = None) -> Optional[Wallet]:
         """Retrieve a user's current or specified wallet."""
         conn = self.get_db_connection()
@@ -194,7 +199,7 @@ class XRPLBot:
         conn.close()
         return wallet
 
-    ### XRPL Utilities
+    ###### XRPL Utilities
     async def get_fee(self) -> str:
         """Get the current network fee."""
         async with await self.get_available_client() as client:
@@ -212,7 +217,7 @@ class XRPLBot:
             response = await client.request(AccountInfo(account=wallet.classic_address, ledger_index="validated"))
             return drops_to_xrp(response.result["account_data"]["Balance"]) if response.is_successful() else 0.0
 
-    ### Trading and Price Fetching
+    ############# Trading and Price Fetching
     async def fetch_price_data(self, currency: str, issuer: str) -> Dict[str, float]:
         """Fetch real-time bid and ask prices from the DEX order book."""
         async with await self.get_available_client() as client:
@@ -247,7 +252,7 @@ class XRPLBot:
         for currency, issuer in tokens:
             await self.fetch_price_data(currency, issuer)
 
-    ### Technical Analysis
+    ##################################### Technical Analysis
     def calculate_sma(self, prices: List[float], period: int) -> List[float]:
         """Calculate Simple Moving Average."""
         return [mean(prices[max(0, i-period+1):i+1]) for i in range(len(prices))]
@@ -335,7 +340,7 @@ class XRPLBot:
         except ValueError:
             raise ValueError("Invalid amount format")
 
-    ### Telegram UI - Menu System with Emojis
+    ############################################## Telegram UI - Menu System with Emojis
     def get_main_menu(self) -> InlineKeyboardMarkup:
         """Main menu keyboard with emojis."""
         keyboard = [
